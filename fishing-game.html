@@ -57,6 +57,11 @@ const CONFIG = {
     hookDepth: 25,
     interestRadius: 220,         // fish closer than this can notice the bait
   },
+  peek: {                        // "look under the water" view (E / ↓ / button)
+    focal: 520,
+    behind: 110,                 // how far behind the bait the underwater camera sits
+    fadeSpeed: 3,
+  },
 };
 
 // ---------- 2. FISH ----------
@@ -89,7 +94,15 @@ const game = {
   pull: 0, pullDir: 1, pullTimer: 0, reelSpin: 0,
   message: '', messageTimer: 0,
   lastCatch: null, journalOpen: false,
+  // underwater look
+  peek: 0, peekTarget: 0,
+  ucam: { X: 0, Z: 0, depth: 20 },
+  bubbles: [],
+  motes: Array.from({ length: 70 }, () => ({ x: Math.random() * 960, y: Math.random() * 540, s: 0.5 + Math.random() * 1.5 })),
 };
+const PEEK_STATES = ['WAITING', 'BITE', 'REELING', 'LOST'];
+const canPeek = () => PEEK_STATES.includes(game.state);
+function togglePeek() { if (canPeek()) game.peekTarget = game.peekTarget ? 0 : 1; }
 
 function save() {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify({ coins: game.coins, caught: game.caught, best: game.best })); } catch (e) {}
@@ -111,7 +124,14 @@ function release() { if (input.down)  { input.down = false; input.released = tru
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-canvas.addEventListener('pointerdown', e => { e.preventDefault(); aimFromPointer(e); press(); });
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const cx = (e.clientX - r.left) / r.width * CONFIG.W, cy = (e.clientY - r.top) / r.height * CONFIG.H;
+  const btn = PEEK_BUTTON;
+  if (canPeek() && cx >= btn.x && cx <= btn.x + btn.w && cy >= btn.y && cy <= btn.y + btn.h) { togglePeek(); return; }
+  aimFromPointer(e); press();
+});
 canvas.addEventListener('pointermove', aimFromPointer);
 window.addEventListener('pointerup', release);
 window.addEventListener('pointercancel', release);
@@ -120,6 +140,7 @@ window.addEventListener('keydown', e => {
   if (e.code === 'ArrowLeft') input.left = true;
   if (e.code === 'ArrowRight') input.right = true;
   if (e.code === 'KeyJ') game.journalOpen = !game.journalOpen;
+  if ((e.code === 'KeyE' || e.code === 'ArrowDown') && !e.repeat) { e.preventDefault(); togglePeek(); }
   if (e.code === 'KeyR' && !e.repeat) resetSave();
 });
 window.addEventListener('keyup', e => {
@@ -280,6 +301,7 @@ function updateFish(f, dt) {
       faceHook(f, dt);
       if (slideTo(f, contactPt(f), spd * 1.4, dt) < 1.5) {
         game.dip = 0.5; f.nibblesLeft--; f.mode = 'backoff'; addRipple(game.bob.X, game.bob.Z, 0.5);
+        addBubbles(hk.X, hk.Z, hk.depth, 3);
       }
       break;
     case 'backoff':
@@ -292,6 +314,7 @@ function updateFish(f, dt) {
         f.mode = 'holding';
         game.fish = { ...f.sp, size: f.size };
         addRipple(game.bob.X, game.bob.Z, 1.2);
+        addBubbles(hk.X, hk.Z, hk.depth, 7);
         setState('BITE');
       }
       break;
@@ -464,7 +487,8 @@ function update(dt) {
       followCamera(dt, f.X, f.Z);
       const p = project(game.bob.X, game.bob.Z, -2);
       b.x = p.x; b.y = p.y; b.s = p.s;
-      if (game.pull > 0.3 && Math.random() < dt * 8) addRipple(f.X, f.Z, 0.6);
+      if (game.pull > 0.3 && Math.random() < dt * 8) { addRipple(f.X, f.Z, 0.6); addBubbles(f.X, f.Z, f.depth, 1); }
+      Object.assign(hk, { X: game.bob.X, Z: game.bob.Z, depth: f.depth });
 
       const lose = msg => { f.mode = 'flee'; f.timer = 3; hk.X = f.X; hk.Z = f.Z; onFishLost(msg); };
       if (game.tension >= 1) lose('SNAP! The line broke.');
@@ -478,7 +502,7 @@ function update(dt) {
       followCamera(dt, game.bob.X, game.bob.Z);
       game.dip = Math.max(0, game.dip - dt * 2);
       placeBobber();
-      if (game.stateTime > 1.3) toIdle();
+      if (game.stateTime > (game.peekTarget ? 2.2 : 1.3)) toIdle();
       break;
 
     case 'RESULT':
@@ -487,7 +511,27 @@ function update(dt) {
       break;
   }
 
+  updatePeek(dt);
   input.pressed = input.released = false;
+}
+
+// Underwater camera: sits a little behind and level with the bait (or the hooked fish)
+function updatePeek(dt) {
+  if (!canPeek()) game.peekTarget = 0;
+  const P = CONFIG.peek;
+  game.peek = clamp(game.peek + (game.peekTarget ? 1 : -1) * dt * P.fadeSpeed, 0, 1);
+  const hk = game.hookW, uc = game.ucam;
+  const tX = hk.X, tZ = hk.Z - P.behind;
+  const tD = clamp(hk.depth - 3, 3, bedDepth(tX, tZ) - 4);
+  if (game.peek === 0) { uc.X = tX; uc.Z = tZ; uc.depth = tD; }
+  const k = Math.min(1, dt * 3);
+  uc.X += (tX - uc.X) * k; uc.Z += (tZ - uc.Z) * k; uc.depth += (tD - uc.depth) * k;
+  for (const b of game.bubbles) { b.depth -= b.vy * dt; b.ph += dt * 5; }
+  game.bubbles = game.bubbles.filter(b => b.depth > 0);
+  for (const m of game.motes) { m.y -= dt * m.s * 3; m.x += Math.sin(game.time * 0.4 + m.y * 0.05) * dt * 4; if (m.y < 0) { m.y = CONFIG.H; m.x = Math.random() * CONFIG.W; } }
+}
+function addBubbles(X, Z, depth, n) {
+  for (let i = 0; i < n; i++) game.bubbles.push({ X: X + rand(-2, 2), Z: Z + rand(-2, 2), depth: depth + rand(-1, 1), r: rand(0.4, 1.1), vy: rand(10, 18), ph: rand(0, 6) });
 }
 
 function toIdle() {
@@ -520,6 +564,18 @@ function onFishLost(reason) {
 function draw() {
   const C = CONFIG;
   ctx.clearRect(0, 0, C.W, C.H);
+  if (game.peek < 1) drawSurfaceScene();
+  if (game.peek > 0) {
+    ctx.save(); ctx.globalAlpha = ease(game.peek); drawUnderwater(); ctx.restore();
+  }
+  drawHUD();
+  if (canPeek()) drawPeekButton();
+  if (game.state === 'RESULT') drawResult();
+  if (game.journalOpen) drawJournal();
+}
+
+function drawSurfaceScene() {
+  const C = CONFIG;
   drawSky();
   renderWater();
   drawFishes();
@@ -533,9 +589,161 @@ function draw() {
   drawLine();
   if (off < C.H + 50) { drawBoat(); drawRodAndHands(); }
   ctx.restore();
-  drawHUD();
-  if (game.state === 'RESULT') drawResult();
-  if (game.journalOpen) drawJournal();
+}
+
+// ----- underwater look -----
+// Same procedural world, seen from a camera under the surface. Low-res ray shader for
+// the surface-from-below (Snell's window) and the lake bed, then fish, line and bubbles on top.
+const UW_W = 160, UW_H = 90;
+const uwCanvas = document.createElement('canvas');
+uwCanvas.width = UW_W; uwCanvas.height = UW_H;
+const uwctx = uwCanvas.getContext('2d');
+const uwImg = uwctx.createImageData(UW_W, UW_H);
+const PEEK_BUTTON = { x: 960 - 176, y: 540 - 56, w: 160, h: 40 };
+
+function projU(X, Z, depth) {
+  const uc = game.ucam, F = CONFIG.peek.focal, zz = Z - uc.Z;
+  if (zz < 6) return null;
+  return { x: CONFIG.W / 2 + (X - uc.X) * F / zz, y: CONFIG.H / 2 + (depth - uc.depth) * F / zz, s: F / zz, zz };
+}
+
+function renderUnderwaterBackdrop() {
+  const C = CONFIG, F = CONFIG.peek.focal, uc = game.ucam, t = game.time, d = uwImg.data;
+  let i = 0;
+  for (let py = 0; py < UW_H; py++) {
+    const dy = ((py + 0.5) * C.H / UW_H - C.H / 2) / F;
+    for (let px = 0; px < UW_W; px++) {
+      const dx = ((px + 0.5) * C.W / UW_W - C.W / 2) / F;
+      const len = Math.sqrt(dx * dx + dy * dy + 1);
+      let r, g, b, dist, fr, fg, fb;
+      if (dy < -0.002) {                       // looking up at the underside of the surface
+        const tt = uc.depth / -dy, X = uc.X + dx * tt, Z = uc.Z + tt;
+        dist = tt * len;
+        const cosUp = -dy / len;                // Snell's window ≈ 48.6° → cos > 0.66
+        const rip = Math.sin(X * 0.12 + t * 2.1) + Math.sin(Z * 0.1 - t * 1.7) + Math.sin((X - Z) * 0.07 + t * 1.3);
+        const win = clamp((cosUp - 0.6) * 12, 0, 1);                     // bright sky window
+        const glow = clamp((cosUp - 0.05) / 0.6, 0, 1) * (0.85 + rip * 0.08);  // silvery underside
+        r = lerp(50 + 110 * glow, 210, win); g = lerp(120 + 100 * glow, 238, win); b = lerp(140 + 95 * glow, 250, win);
+      } else {                                  // looking down/forward at the lake bed
+        const dyy = Math.max(dy, 0.002);
+        let tt = (bedDepth(uc.X, uc.Z + 60) - uc.depth) / dyy;
+        let X = uc.X + dx * tt, Z = uc.Z + tt;
+        tt = Math.max(0, bedDepth(X, Z) - uc.depth) / dyy; X = uc.X + dx * tt; Z = uc.Z + tt;
+        dist = tt * len;
+        const D = bedDepth(X, Z);
+        const m = vnoise(X * 0.025, Z * 0.025), grain = 0.85 + vnoise(X * 0.15, Z * 0.15) * 0.3;
+        const weed = clamp((m - 0.58) * 8, 0, 1), rock = clamp((0.3 - m) * 10, 0, 1), sand = 1 - weed - rock;
+        let cs = Math.sin(X * 0.09 + t * 1.4) + Math.sin(Z * 0.11 - t * 1.1) + Math.sin((X + Z) * 0.06 + t * 0.8);
+        cs = 1 + (cs > 1 ? (cs - 1) * 0.6 * Math.exp(-D * 0.02) : 0);
+        const shade = Math.exp(-D * 0.012) * grain * cs;
+        r = (190 * sand + 58 * weed + 96 * rock) * shade;
+        g = (172 * sand + 96 * weed + 94 * rock) * shade;
+        b = (120 * sand + 44 * weed + 88 * rock) * shade;
+      }
+      // fog colour: brighter looking up, darker looking down (smooth, so no hard horizon line)
+      const up = clamp(0.5 - dy * 2.5, 0, 1);
+      fr = lerp(8, 46, up); fg = lerp(48, 128, up); fb = lerp(68, 152, up);
+      // fog fades to the water colour with distance (red goes first)
+      const ar = Math.exp(-dist * 0.016), ag = Math.exp(-dist * 0.008), ab = Math.exp(-dist * 0.006);
+      d[i++] = r * ar + fr * (1 - ar); d[i++] = g * ag + fg * (1 - ag); d[i++] = b * ab + fb * (1 - ab); d[i++] = 255;
+    }
+  }
+  uwctx.putImageData(uwImg, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(uwCanvas, 0, 0, C.W, C.H);
+}
+
+function drawUnderwater() {
+  const C = CONFIG, t = game.time;
+  renderUnderwaterBackdrop();
+
+  // light shafts
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let k = 0; k < 6; k++) {
+    const x0 = k * 190 - 60 + Math.sin(t * 0.25 + k * 1.7) * 50, w = 24 + (k % 3) * 16;
+    const lg = ctx.createLinearGradient(0, 0, 0, C.H);
+    lg.addColorStop(0, 'rgba(255,250,220,0.10)'); lg.addColorStop(1, 'rgba(255,250,220,0)');
+    ctx.fillStyle = lg;
+    ctx.beginPath(); ctx.moveTo(x0, 0); ctx.lineTo(x0 + w, 0); ctx.lineTo(x0 + w + 160, C.H); ctx.lineTo(x0 + 90, C.H); ctx.fill();
+  }
+  ctx.restore();
+
+  // drifting specks
+  ctx.fillStyle = 'rgba(220,240,255,0.3)';
+  for (const m of game.motes) ctx.fillRect(m.x, m.y, m.s, m.s);
+
+  // fish, far to near
+  const list = [];
+  for (const f of game.fishes) { const p = projU(f.X, f.Z, f.depth); if (p && p.zz < 700) list.push({ f, p }); }
+  list.sort((a, b) => b.p.zz - a.p.zz);
+  const hk = game.hookW, bob = projU(game.bob.X, game.bob.Z, 0), hook = projU(hk.X, hk.Z, hk.depth);
+  let lineDrawn = false;
+  const drawLineAndHook = () => {
+    lineDrawn = true;
+    if (!hook) return;
+    ctx.strokeStyle = 'rgba(235,248,255,0.6)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(hook.x, hook.y);
+    if (game.state === 'REELING' || game.state === 'LOST') ctx.lineTo(hook.x - (hk.X - game.ucam.X) * 0.2, -10);   // up toward the rod
+    else if (bob) ctx.lineTo(bob.x, bob.y);
+    ctx.stroke();
+    if (game.state !== 'REELING' && game.state !== 'LOST') drawHookAndBait(hook.x, hook.y, hook.s);
+  };
+  for (const { f, p } of list) {
+    if (!lineDrawn && p.zz < (hook ? hook.zz : 0)) drawLineAndHook();
+    const c = Math.cos(f.heading), dir = c >= 0 ? 1 : -1, squash = Math.max(0.3, Math.abs(c));
+    ctx.save(); ctx.globalAlpha *= Math.exp(-p.zz * 0.004);
+    drawFishShape(p.x, p.y, f.len * p.s, dir, f.sp, f.phase, 1, squash);
+    ctx.restore();
+  }
+  if (!lineDrawn) drawLineAndHook();
+
+  // bobber seen from below
+  if (bob && game.state !== 'REELING') {
+    const rr = Math.max(2, 3.2 * bob.s);
+    ctx.fillStyle = '#f2f2f2'; ctx.beginPath(); ctx.arc(bob.x, bob.y + game.dip * 2 * bob.s, rr, 0, Math.PI); ctx.fill();
+    ctx.fillStyle = 'rgba(231,76,60,0.55)'; ctx.beginPath(); ctx.arc(bob.x, bob.y + game.dip * 2 * bob.s, rr, Math.PI, 0); ctx.fill();
+  }
+
+  // bubbles
+  ctx.strokeStyle = 'rgba(230,248,255,0.75)'; ctx.lineWidth = 1;
+  for (const b of game.bubbles) {
+    const p = projU(b.X, b.Z, b.depth); if (!p) continue;
+    ctx.beginPath(); ctx.arc(p.x + Math.sin(b.ph) * 2, p.y, Math.max(1, b.r * p.s), 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // cues
+  if (game.state === 'BITE' && hook) {
+    ctx.fillStyle = '#ffeb3b'; ctx.font = 'bold 44px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText('!', hook.x, hook.y - 40 + Math.sin(t * 30) * 3);
+  } else if (game.state === 'WAITING' && game.dip > 0.2 && hook) {
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.font = 'italic 16px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText('nibble…', hook.x + 60, hook.y - 20);
+  }
+
+  // vignette
+  const vg = ctx.createRadialGradient(C.W / 2, C.H / 2, C.H * 0.35, C.W / 2, C.H / 2, C.W * 0.65);
+  vg.addColorStop(0, 'rgba(0,10,20,0)'); vg.addColorStop(1, 'rgba(0,10,20,0.5)');
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, C.W, C.H);
+}
+
+function drawHookAndBait(x, y, s) {
+  const k = clamp(s / 4, 0.6, 2.5), t = game.time;
+  ctx.strokeStyle = '#d0d4d8'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(x, y - 8 * k); ctx.lineTo(x, y + 3 * k); ctx.arc(x - 3.5 * k, y + 3 * k, 3.5 * k, 0, Math.PI * 0.9); ctx.stroke();
+  ctx.strokeStyle = '#d9707e'; ctx.lineWidth = 3 * k; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x, y - 4 * k);
+  ctx.quadraticCurveTo(x + (6 + Math.sin(t * 5) * 2) * k, y, x + k, y + 5 * k);
+  ctx.quadraticCurveTo(x + (-6 + Math.sin(t * 6) * 3) * k, y + 10 * k, x + (-3 + Math.sin(t * 4) * 4) * k, y + 14 * k);
+  ctx.stroke();
+}
+
+function drawPeekButton() {
+  const b = PEEK_BUTTON, on = game.peekTarget === 1;
+  ctx.fillStyle = on ? 'rgba(246,216,168,0.92)' : 'rgba(10,25,40,0.78)';
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.strokeStyle = '#f6d8a8'; ctx.lineWidth = 1.5; ctx.strokeRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = on ? '#0b2233' : '#fff'; ctx.font = 'bold 14px system-ui'; ctx.textAlign = 'center';
+  ctx.fillText(on ? '▲ Back up  (E)' : '▼ Look under  (E)', b.x + b.w / 2, b.y + 25);
 }
 
 function drawSky() {
@@ -821,8 +1029,9 @@ function drawRodAndHands() {
 }
 
 // Side-view fish (used on the catch card and in the journal)
-function drawFishShape(x, y, L, dir, sp, phase, alpha) {
-  ctx.save(); ctx.translate(x, y); ctx.scale(dir, 1); ctx.globalAlpha = alpha;
+function drawFishShape(x, y, L, dir, sp, phase, alpha, squash = 1) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(dir * squash, 1); ctx.globalAlpha *= alpha;
+  const baseA = ctx.globalAlpha;
   const wag = Math.sin(phase) * L * 0.07;
   ctx.fillStyle = mix(sp.color, '#000000', 0.25);
   ctx.beginPath(); ctx.moveTo(-L * 0.36, 0); ctx.lineTo(-L * 0.56, -L * 0.17 + wag); ctx.lineTo(-L * 0.5, wag); ctx.lineTo(-L * 0.56, L * 0.17 + wag); ctx.closePath(); ctx.fill();
@@ -840,9 +1049,9 @@ function drawFishShape(x, y, L, dir, sp, phase, alpha) {
   if (sp.pattern === 'spots') { ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.beginPath(); ctx.ellipse(L * 0.05, -L * 0.08, L * 0.12, L * 0.07, 0.3, 0, Math.PI * 2); ctx.ellipse(-L * 0.22, 0, L * 0.08, L * 0.06, 0, 0, Math.PI * 2); ctx.fill(); }
   ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(-L * 0.4, -L * 0.04, L * 0.9, L * 0.03);
   ctx.restore();
-  ctx.fillStyle = mix(sp.color, '#ffffff', 0.3); ctx.globalAlpha = alpha * 0.8;
+  ctx.fillStyle = mix(sp.color, '#ffffff', 0.3); ctx.globalAlpha = baseA * 0.8;
   ctx.beginPath(); ctx.moveTo(L * 0.22, L * 0.05); ctx.quadraticCurveTo(L * 0.1, L * 0.2 + wag * 0.5, L * 0.03, L * 0.13); ctx.closePath(); ctx.fill();
-  ctx.globalAlpha = alpha;
+  ctx.globalAlpha = baseA;
   ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = Math.max(1, L * 0.015);
   ctx.beginPath(); ctx.arc(L * 0.24, 0, L * 0.12, -1, 1); ctx.stroke();
   ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(L * 0.37, -L * 0.05, Math.max(1.5, L * 0.04), 0, Math.PI * 2); ctx.fill();
@@ -863,6 +1072,12 @@ function bar(x, y, w, h, v, color, label) {
 
 function drawHUD() {
   const C = CONFIG;
+  ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 4;
+  drawHUDInner();
+  ctx.restore();
+}
+function drawHUDInner() {
+  const C = CONFIG;
   ctx.textAlign = 'left'; ctx.fillStyle = '#fff'; ctx.font = 'bold 18px system-ui';
   ctx.fillText(`🪙 ${game.coins}`, 16, 30);
   const total = Object.values(game.caught).reduce((a, b) => a + b, 0);
@@ -875,7 +1090,7 @@ function drawHUD() {
   const hints = {
     IDLE: 'Aim with mouse / ← →  ·  hold SPACE / click to charge',
     CHARGING: 'Release to cast!',
-    WAITING: interested ? 'A fish is checking out your bait… wait for the bite!' : 'Watch the fish around your bobber  (press to reel in)',
+    WAITING: interested ? 'A fish is checking out your bait… wait for the bite!' : 'Watch the fish around your bobber  ·  E: look under',
     BITE: 'BITE! Press now!',
     REELING: 'Hold to reel · release to ease tension',
   };
