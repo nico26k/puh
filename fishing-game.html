@@ -57,6 +57,11 @@ const CONFIG = {
     hookDepth: 25,
     interestRadius: 220,         // fish closer than this can notice the bait
   },
+  look: {                        // free-look: right-drag, WASD, or F to lock the mouse
+    sensitivity: 0.005,          // radians per pixel of mouse movement
+    keySpeed: 1.6,               // radians per second with WASD
+    maxYaw: 1.3, minPitch: -0.5, maxPitch: 0.75,
+  },
   peek: {                        // "look under the water" view (E / ↓ / button)
     focal: 520,
     behind: 110,                 // how far behind the bait the underwater camera sits
@@ -94,6 +99,7 @@ const game = {
   pull: 0, pullDir: 1, pullTimer: 0, reelSpin: 0,
   message: '', messageTimer: 0,
   lastCatch: null, journalOpen: false,
+  look: { yaw: 0, pitch: 0, dragging: false, locked: false, lx: 0, ly: 0, recenter: false },
   // underwater look
   peek: 0, peekTarget: 0,
   ucam: { X: 0, Z: 0, depth: 20 },
@@ -118,35 +124,66 @@ function setState(s) { game.state = s; game.stateTime = 0; }
 function toast(msg, t = 2.2) { game.message = msg; game.messageTimer = t; }
 
 // ---------- 4. INPUT ----------
-const input = { down: false, pressed: false, released: false, left: false, right: false };
+const input = { down: false, pressed: false, released: false, left: false, right: false, keys: {} };
 function press()   { if (!input.down) { input.down = true; input.pressed = true; } }
 function release() { if (input.down)  { input.down = false; input.released = true; } }
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
+canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('pointerdown', e => {
   e.preventDefault();
+  const L = game.look;
+  if (e.button === 2) {                 // right mouse: drag to look around
+    L.dragging = true; L.lx = e.clientX; L.ly = e.clientY;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    return;
+  }
+  if (e.button !== 0) return;
   const r = canvas.getBoundingClientRect();
   const cx = (e.clientX - r.left) / r.width * CONFIG.W, cy = (e.clientY - r.top) / r.height * CONFIG.H;
   const btn = PEEK_BUTTON;
   if (canPeek() && cx >= btn.x && cx <= btn.x + btn.w && cy >= btn.y && cy <= btn.y + btn.h) { togglePeek(); return; }
   aimFromPointer(e); press();
 });
-canvas.addEventListener('pointermove', aimFromPointer);
-window.addEventListener('pointerup', release);
-window.addEventListener('pointercancel', release);
+canvas.addEventListener('pointermove', e => {
+  const L = game.look;
+  if (L.dragging) { lookBy(e.clientX - L.lx, e.clientY - L.ly); L.lx = e.clientX; L.ly = e.clientY; return; }
+  aimFromPointer(e);
+});
+window.addEventListener('pointerup', e => { if (e.button === 2) game.look.dragging = false; else release(); });
+window.addEventListener('pointercancel', () => { game.look.dragging = false; release(); });
+document.addEventListener('mousemove', e => { if (game.look.locked) lookBy(e.movementX, e.movementY); });
+document.addEventListener('pointerlockchange', () => { game.look.locked = document.pointerLockElement === canvas; });
+function lookBy(dx, dy) {
+  const L = game.look, K = CONFIG.look;
+  L.recenter = false;
+  L.yaw = clamp(L.yaw + dx * K.sensitivity, -K.maxYaw, K.maxYaw);
+  L.pitch = clamp(L.pitch + dy * K.sensitivity, K.minPitch, K.maxPitch);
+}
+function togglePointerLock() {
+  const fail = () => toast('Mouse lock is not available here — use right-drag or WASD');
+  try {
+    if (document.pointerLockElement === canvas) document.exitPointerLock();
+    else { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(fail); }
+  } catch (err) { fail(); }
+}
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) press(); }
   if (e.code === 'ArrowLeft') input.left = true;
   if (e.code === 'ArrowRight') input.right = true;
   if (e.code === 'KeyJ') game.journalOpen = !game.journalOpen;
   if ((e.code === 'KeyE' || e.code === 'ArrowDown') && !e.repeat) { e.preventDefault(); togglePeek(); }
+  if (['KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code)) input.keys[e.code] = true;
+  if (e.code === 'KeyF' && !e.repeat) togglePointerLock();
+  if (e.code === 'KeyC') game.look.recenter = true;
   if (e.code === 'KeyR' && !e.repeat) resetSave();
 });
 window.addEventListener('keyup', e => {
   if (e.code === 'Space') release();
   if (e.code === 'ArrowLeft') input.left = false;
   if (e.code === 'ArrowRight') input.right = false;
+  if (input.keys[e.code]) input.keys[e.code] = false;
 });
 function aimFromPointer(e) {
   if (game.state !== 'IDLE' && game.state !== 'CHARGING') return;
@@ -188,7 +225,7 @@ function mulberry32(a) {
 }
 // Lake-bed depth: shallow near the boat, deeper further out, with hills & holes
 function bedDepth(X, Z) {
-  return clamp(14 + Math.max(0, Z) * 0.11 + (vnoise(X * 0.005, Z * 0.005) - 0.5) * 40, 6, 120);
+  return clamp(22 + Math.max(0, Z) * 0.1 + (vnoise(X * 0.005, Z * 0.005) - 0.5) * 40, 6, 120);
 }
 
 // Fish live in chunks. A chunk is generated (deterministically from the seed)
@@ -231,12 +268,36 @@ function makeFish(sp, X, Z, rng, chunk) {
 
 // ---------- 6. CAMERA ----------
 // World: X = sideways, Z = distance out from the boat, Y = height (negative = underwater)
+// Camera basis from free-look yaw/pitch (right, up, forward vectors in world space)
+const CB = { rx: 1, rz: 0, ux: 0, uy: 1, uz: 0, fx: 0, fy: 0, fz: 1 };
+function updateBasis() {
+  const y = game.look.yaw, p = game.look.pitch, sy = Math.sin(y), cy = Math.cos(y), sp = Math.sin(p), cp = Math.cos(p);
+  CB.rx = cy; CB.rz = -sy;
+  CB.fx = sy * cp; CB.fy = -sp; CB.fz = cy * cp;
+  CB.ux = sy * sp; CB.uy = cp; CB.uz = cy * sp;
+}
 function project(X, Z, Y = 0) {
   const { focal, nearZ } = CONFIG.camera, cam = game.cam;
-  const z = Math.max(1, Z - cam.z + nearZ);
-  return { x: CONFIG.W / 2 + (X - cam.x) * focal / z, y: CONFIG.horizonY + (cam.h - Y) * focal / z, s: 300 / z, z };
+  const ax = X - cam.x, ay = Y - cam.h, az = Z - cam.z + nearZ;
+  const xc = ax * CB.rx + az * CB.rz, yc = ax * CB.ux + ay * CB.uy + az * CB.uz, z0 = ax * CB.fx + ay * CB.fy + az * CB.fz;
+  const z = Math.max(1, z0);
+  return { x: CONFIG.W / 2 + xc * focal / z, y: CONFIG.horizonY - yc * focal / z, s: 300 / z, z, behind: z0 < 1 };
 }
 const aimToX = (aim, Z) => aim * CONFIG.aimSpread * (Z + CONFIG.camera.nearZ);
+// cast direction = mouse aim + the direction you're looking
+const curAim = () => clamp(game.aim + Math.tan(game.look.yaw) / CONFIG.aimSpread, -4, 4);
+
+function updateLook(dt) {
+  const L = game.look, K = CONFIG.look, k = input.keys;
+  const kx = (k.KeyD ? 1 : 0) - (k.KeyA ? 1 : 0), ky = (k.KeyS ? 1 : 0) - (k.KeyW ? 1 : 0);
+  if (kx || ky) lookBy(kx * K.keySpeed * dt / K.sensitivity, ky * K.keySpeed * 0.7 * dt / K.sensitivity);
+  if (L.recenter && !L.dragging) {
+    const r = Math.min(1, dt * 4);
+    L.yaw -= L.yaw * r; L.pitch -= L.pitch * r;
+    if (Math.abs(L.yaw) + Math.abs(L.pitch) < 0.002) { L.yaw = 0; L.pitch = 0; L.recenter = false; }
+  }
+  updateBasis();
+}
 function followCamera(dt, X, Z) {
   const tz = Math.max(0, Z - CONFIG.camera.followDist), k = Math.min(1, dt * 2.5);
   game.cam.z += (tz - game.cam.z) * k;
@@ -368,6 +429,8 @@ function update(dt) {
   if (input.left)  game.aim = clamp(game.aim - dt * 1.5, -1, 1);
   if (input.right) game.aim = clamp(game.aim + dt * 1.5, -1, 1);
 
+  updateLook(dt);
+  for (const bd of BIRDS) { bd.a += bd.sp * dt; bd.ph += dt * bd.flap; if (bd.a > 1.8) { bd.a = -1.8; bd.e = rand(0.1, 0.24); } }
   if (game.journalOpen) { if (input.pressed) game.journalOpen = false; input.pressed = input.released = false; return; }
 
   const C = CONFIG, b = game.bobber, hk = game.hookW;
@@ -395,7 +458,8 @@ function update(dt) {
       if (game.power <= 0) { game.power = 0; game.powerDir = 1; }
       if (input.released) {
         game.castDist = lerp(C.cast.minDist, C.cast.maxDist, game.power);
-        game.castAim = game.aim;
+        game.castAim = curAim();
+        game.look.recenter = !game.look.locked;     // swing the view back so you can follow the throw
         game.castX = aimToX(game.castAim, game.castDist);
         setState('CASTING');
       }
@@ -576,19 +640,25 @@ function draw() {
 
 function drawSurfaceScene() {
   const C = CONFIG;
-  drawSky();
-  renderWater();
+  renderScene();
+  drawRidges();
+  drawBirds();
   drawFishes();
   if (game.state === 'WAITING' || game.state === 'BITE') drawHookLine();
   drawRipples();
   if (game.state === 'IDLE' || game.state === 'CHARGING') drawAimGuide();
   drawBobber();
   drawSplash();
-  const off = boatOffset();
+  drawSunBloom();
+  const off = boatOffset(), f = C.camera.focal;
+  // the boat is part of the world, so it shifts as you look around; rod & hands stay with you
+  const bx = -Math.tan(game.look.yaw) * f * 0.85, by = -Math.tan(game.look.pitch) * f * 0.85;
+  if (off < C.H + 50) { ctx.save(); ctx.translate(bx, off + by); drawBoat(); ctx.restore(); }
   ctx.save(); ctx.translate(0, off);
   drawLine();
-  if (off < C.H + 50) { drawBoat(); drawRodAndHands(); }
+  if (off < C.H + 50) drawRodAndHands();
   ctx.restore();
+  drawVignette();
 }
 
 // ----- underwater look -----
@@ -602,37 +672,40 @@ const uwImg = uwctx.createImageData(UW_W, UW_H);
 const PEEK_BUTTON = { x: 960 - 176, y: 540 - 56, w: 160, h: 40 };
 
 function projU(X, Z, depth) {
-  const uc = game.ucam, F = CONFIG.peek.focal, zz = Z - uc.Z;
-  if (zz < 6) return null;
-  return { x: CONFIG.W / 2 + (X - uc.X) * F / zz, y: CONFIG.H / 2 + (depth - uc.depth) * F / zz, s: F / zz, zz };
+  const uc = game.ucam, F = CONFIG.peek.focal;
+  const ax = X - uc.X, ay = uc.depth - depth, az = Z - uc.Z;      // y up
+  const zc = ax * CB.fx + ay * CB.fy + az * CB.fz;
+  if (zc < 6) return null;
+  const xc = ax * CB.rx + az * CB.rz, yc = ax * CB.ux + ay * CB.uy + az * CB.uz;
+  return { x: CONFIG.W / 2 + xc * F / zc, y: CONFIG.H / 2 - yc * F / zc, s: F / zc, zz: zc };
 }
 
 function renderUnderwaterBackdrop() {
   const C = CONFIG, F = CONFIG.peek.focal, uc = game.ucam, t = game.time, d = uwImg.data;
   let i = 0;
   for (let py = 0; py < UW_H; py++) {
-    const dy = ((py + 0.5) * C.H / UW_H - C.H / 2) / F;
+    const dy = (C.H / 2 - (py + 0.5) * C.H / UW_H) / F;
     for (let px = 0; px < UW_W; px++) {
       const dx = ((px + 0.5) * C.W / UW_W - C.W / 2) / F;
-      const len = Math.sqrt(dx * dx + dy * dy + 1);
-      let r, g, b, dist, fr, fg, fb;
-      if (dy < -0.002) {                       // looking up at the underside of the surface
-        const tt = uc.depth / -dy, X = uc.X + dx * tt, Z = uc.Z + tt;
-        dist = tt * len;
-        const cosUp = -dy / len;                // Snell's window ≈ 48.6° → cos > 0.66
+      let wx = dx * CB.rx + dy * CB.ux + CB.fx, wy = dy * CB.uy + CB.fy, wz = dx * CB.rz + dy * CB.uz + CB.fz;
+      const il = 1 / Math.sqrt(wx * wx + wy * wy + wz * wz); wx *= il; wy *= il; wz *= il;
+      let r, g, b, dist;
+      if (wy > 0.002) {                       // looking up at the underside of the surface
+        const tt = uc.depth / wy, X = uc.X + wx * tt, Z = uc.Z + wz * tt;
+        dist = tt;
         const rip = Math.sin(X * 0.12 + t * 2.1) + Math.sin(Z * 0.1 - t * 1.7) + Math.sin((X - Z) * 0.07 + t * 1.3);
-        const win = clamp((cosUp - 0.6) * 12, 0, 1);                     // bright sky window
-        const glow = clamp((cosUp - 0.05) / 0.6, 0, 1) * (0.85 + rip * 0.08);  // silvery underside
+        const win = clamp((wy - 0.6) * 12, 0, 1);                         // Snell's window: bright sky
+        const glow = clamp((wy - 0.05) / 0.6, 0, 1) * (0.85 + rip * 0.08); // silvery underside
         r = lerp(50 + 110 * glow, 210, win); g = lerp(120 + 100 * glow, 238, win); b = lerp(140 + 95 * glow, 250, win);
-      } else {                                  // looking down/forward at the lake bed
-        const dyy = Math.max(dy, 0.002);
-        let tt = (bedDepth(uc.X, uc.Z + 60) - uc.depth) / dyy;
-        let X = uc.X + dx * tt, Z = uc.Z + tt;
-        tt = Math.max(0, bedDepth(X, Z) - uc.depth) / dyy; X = uc.X + dx * tt; Z = uc.Z + tt;
-        dist = tt * len;
+      } else {                                // the lake bed
+        const dn = Math.max(-wy, 0.002);
+        let tt = (bedDepth(uc.X + wx * 60, uc.Z + wz * 60) - uc.depth) / dn;
+        let X = uc.X + wx * tt, Z = uc.Z + wz * tt;
+        tt = Math.max(0, bedDepth(X, Z) - uc.depth) / dn; X = uc.X + wx * tt; Z = uc.Z + wz * tt;
+        dist = tt;
         const D = bedDepth(X, Z);
         const m = vnoise(X * 0.025, Z * 0.025), grain = 0.85 + vnoise(X * 0.15, Z * 0.15) * 0.3;
-        const weed = clamp((m - 0.58) * 8, 0, 1), rock = clamp((0.3 - m) * 10, 0, 1), sand = 1 - weed - rock;
+        const weed = clamp((m - 0.56) * 4, 0, 1), rock = clamp((0.32 - m) * 5, 0, 1), sand = 1 - weed - rock;
         let cs = Math.sin(X * 0.09 + t * 1.4) + Math.sin(Z * 0.11 - t * 1.1) + Math.sin((X + Z) * 0.06 + t * 0.8);
         cs = 1 + (cs > 1 ? (cs - 1) * 0.6 * Math.exp(-D * 0.02) : 0);
         const shade = Math.exp(-D * 0.012) * grain * cs;
@@ -640,10 +713,9 @@ function renderUnderwaterBackdrop() {
         g = (172 * sand + 96 * weed + 94 * rock) * shade;
         b = (120 * sand + 44 * weed + 88 * rock) * shade;
       }
-      // fog colour: brighter looking up, darker looking down (smooth, so no hard horizon line)
-      const up = clamp(0.5 - dy * 2.5, 0, 1);
-      fr = lerp(8, 46, up); fg = lerp(48, 128, up); fb = lerp(68, 152, up);
-      // fog fades to the water colour with distance (red goes first)
+      // fog: brighter looking up, darker looking down; red fades first
+      const up = clamp(0.5 + wy * 2.5, 0, 1);
+      const fr = lerp(8, 46, up), fg = lerp(48, 128, up), fb = lerp(68, 152, up);
       const ar = Math.exp(-dist * 0.016), ag = Math.exp(-dist * 0.008), ab = Math.exp(-dist * 0.006);
       d[i++] = r * ar + fr * (1 - ar); d[i++] = g * ag + fg * (1 - ag); d[i++] = b * ab + fb * (1 - ab); d[i++] = 255;
     }
@@ -746,37 +818,13 @@ function drawPeekButton() {
   ctx.fillText(on ? '▲ Back up  (E)' : '▼ Look under  (E)', b.x + b.w / 2, b.y + 25);
 }
 
-function drawSky() {
-  const C = CONFIG, px = -game.cam.x * 0.08;
-  const g = ctx.createLinearGradient(0, 0, 0, C.horizonY);
-  g.addColorStop(0, '#5fa8dc'); g.addColorStop(1, '#f7d9a6');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, C.W, C.horizonY);
-  const sg = ctx.createRadialGradient(720 + px, 120, 10, 720 + px, 120, 120);
-  sg.addColorStop(0, 'rgba(255,250,220,1)'); sg.addColorStop(0.3, 'rgba(255,240,190,0.5)'); sg.addColorStop(1, 'rgba(255,240,190,0)');
-  ctx.fillStyle = sg; ctx.fillRect(560 + px, 0, 320, C.horizonY);
-  ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  for (let i = 0; i < 4; i++) {
-    const x = ((i * 290 + game.time * 6 + px) % (C.W + 200) + C.W + 200) % (C.W + 200) - 100, y = 50 + i * 22;
-    ctx.beginPath(); ctx.ellipse(x, y, 60, 14, 0, 0, Math.PI * 2); ctx.ellipse(x + 30, y - 8, 36, 12, 0, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.fillStyle = '#4a765d';
-  ctx.beginPath(); ctx.moveTo(0, C.horizonY);
-  for (let x = 0; x <= C.W; x += 12) {
-    const wx = x - px * 3;
-    ctx.lineTo(x, C.horizonY - 14 - Math.abs(Math.sin(wx * 0.05)) * 10 - Math.sin(wx * 0.007) * 10);
-  }
-  ctx.lineTo(C.W, C.horizonY); ctx.fill();
-}
-
-// Water shader (CPU, low-res, upscaled). Per pixel:
-//   wave normal → Fresnel mix of  [reflected sky + sun glint]  and  [refracted view of the lake bed]
-//   The refracted ray is traced to the procedural bed, which gets sand/weed/rock colour,
-//   moving caustics, and colour-dependent absorption (red fades first) along the path.
-const WATER_W = 200, WATER_H = 90;   // internal resolution — lower = faster, higher = sharper
-const waterCanvas = document.createElement('canvas');
-waterCanvas.width = WATER_W; waterCanvas.height = WATER_H;
-const wctx = waterCanvas.getContext('2d');
-const waterImg = wctx.createImageData(WATER_W, WATER_H);
+// ----- sky, mountains & water -----
+// One ray per pixel from the camera (free-look yaw/pitch included):
+//   up   → sky: golden-hour gradient, sun disk + glow, moving procedural clouds
+//   down → water: wave normals → Fresnel mix of the reflection (sky, clouds, mountains, sun)
+//          and the refraction (lake bed with caustics, colour-dependent absorption)
+// Mountains, hills and the shore treeline are vector silhouettes drawn on top, so edges stay sharp,
+// and the shader uses the same ridge function so they also appear mirrored in the water.
 const WAVES = [
   { dir: [0.8, 0.6],   len: 120, amp: 2.0,  speed: 1.0 },
   { dir: [-0.5, 0.87], len: 70,  amp: 1.1,  speed: 1.3 },
@@ -784,66 +832,218 @@ const WAVES = [
   { dir: [-0.9, 0.44], len: 17,  amp: 0.25, speed: 2.6 },
   { dir: [0.6, -0.8],  len: 9,   amp: 0.12, speed: 3.4 },
 ].map(w => ({ ...w, k: 2 * Math.PI / w.len }));
-const SUN = (() => { const v = [0.43, 0.18, 1]; const l = Math.hypot(...v); return v.map(x => x / l); })();
+const SUN = (() => { const v = [0.43, 0.15, 1]; const l = Math.hypot(...v); return v.map(x => x / l); })();
 const ETA = 1 / 1.33;   // air → water
+const HORIZON_RGB = [248, 204, 158];
 
-function renderWater() {
-  const C = CONFIG, f = C.camera.focal, cam = game.cam, t = game.time, data = waterImg.data;
-  const top = C.horizonY, span = C.H - top, amps = new Float32Array(WAVES.length);
+// Ridges are a height (in radians above the horizon) for every compass direction.
+const RIDGES = [
+  { base: 0.020, amp: 0.085, freq: 4.5, col: [118, 140, 168], haze: 0.55, step: 6 },               // distant mountains
+  { base: 0.010, amp: 0.038, freq: 12,  col: [78, 108, 112],  haze: 0.35, step: 4 },               // hills
+  { base: 0.004, amp: 0.010, freq: 38,  col: [36, 62, 48],    haze: 0.12, step: 2, trees: true },  // shore treeline
+];
+function ridgeH(a, i) {
+  const R = RIDGES[i];
+  let h = R.base + R.amp * vnoise(a * R.freq + i * 37.1, i * 5.3 + 0.5);
+  if (R.trees) {                      // pointy conifer tops of varying height
+    const q = a * 120, tri = 1 - 2 * Math.abs(q - Math.floor(q) - 0.5);
+    h += 0.011 * tri * (0.4 + vnoise(a * 60, 9.1)) + 0.003 * vnoise(a * 400, 3.3);
+  }
+  return h;
+}
+
+// Ridge heights don't change, so the water shader reads them from a lookup table
+const RIDGE_BINS = 4096, RIDGE_TAB = RIDGES.map((_, i) => {
+  const t = new Float32Array(RIDGE_BINS);
+  for (let j = 0; j < RIDGE_BINS; j++) t[j] = ridgeH((j / RIDGE_BINS) * 2 * Math.PI - Math.PI, i);
+  return t;
+});
+const ridgeLookup = (a, i) => RIDGE_TAB[i][((a + Math.PI) * (RIDGE_BINS / (2 * Math.PI))) & (RIDGE_BINS - 1)];
+
+let SR = 0, SG = 0, SB = 0;   // skyColour() writes here (no allocations in the hot loop)
+function skyColour(x, y, z, octaves) {
+  const h = 1 - y, h2 = h * h, h4 = h2 * h2, h8 = h4 * h4;
+  const w = h4 * 0.35 + h8 * 0.65;                       // deep blue zenith → warm gold horizon
+  let r = 54 + (HORIZON_RGB[0] - 54) * w, g = 106 + (HORIZON_RGB[1] - 106) * w, b = 188 + (HORIZON_RGB[2] - 188) * w;
+  const sd = x * SUN[0] + y * SUN[1] + z * SUN[2];
+  let s4 = 0;
+  if (sd > 0) {
+    const s2 = sd * sd; s4 = s2 * s2;
+    const s16 = s4 * s4 * s4 * s4, s64 = s16 * s16 * s16 * s16;
+    r += 70 * s16 + 45 * s4 * h4 + 130 * s64; g += 45 * s16 + 20 * s4 * h4 + 105 * s64; b += 8 * s16 + 55 * s64;
+    if (sd > 0.9994) { r = 255; g = 250; b = 232; }
+  }
+  if (octaves > 0 && y > 0.008) {
+    const k = 1 / y, tm = game.time, cx = x * k * 0.75 + tm * 0.012, cz = z * k * 0.75 + tm * 0.025;
+    let n = vnoise(cx, cz) * 0.55;
+    n += octaves > 1 ? vnoise(cx * 2.3 + 5.1, cz * 2.3) * 0.28 : 0.14;
+    n += octaves > 2 ? vnoise(cx * 5.3, cz * 5.3 + 3.7) * 0.17 : 0.085;
+    const cov = clamp((n - 0.5) * 4.5, 0, 1) * clamp((y - 0.008) * 10, 0, 1);
+    if (cov > 0) {
+      const thick = clamp((n - 0.6) * 4, 0, 1), lit = 1 + 0.7 * s4, gold = h8;
+      const cr = (240 - 78 * thick) * lit + 20 * gold, cg = (226 - 80 * thick) * (1 + 0.45 * s4), cb = (216 - 56 * thick) - 30 * gold;
+      r += (cr - r) * cov; g += (cg - g) * cov; b += (cb - b) * cov;
+    }
+  }
+  SR = r; SG = g; SB = b;
+}
+
+// Resolution adapts to how long a frame takes (smaller = faster, softer)
+const QUALITY = [[256, 144], [224, 126], [192, 108], [160, 90], [128, 72]];
+const sceneCanvas = document.createElement('canvas');
+const sctx = sceneCanvas.getContext('2d');
+let sceneImg = null, qLevel = 1, qAvg = 6;
+function setQuality(level) {
+  qLevel = clamp(level, 0, QUALITY.length - 1);
+  [sceneCanvas.width, sceneCanvas.height] = QUALITY[qLevel];
+  sceneImg = sctx.createImageData(sceneCanvas.width, sceneCanvas.height);
+}
+setQuality(2);
+
+function renderScene() {
+  const t0 = performance.now();
+  const C = CONFIG, f = C.camera.focal, cam = game.cam, t = game.time;
+  const SW = sceneCanvas.width, SH = sceneCanvas.height, data = sceneImg.data;
+  const camZ = cam.z - C.camera.nearZ;
   let i = 0;
-  for (let py = 0; py < WATER_H; py++) {
-    const dy = (py + 0.5) * span / WATER_H;
-    const z = cam.h * f / dy, Z = z + cam.z;
-    const haze = 1 - Math.exp(-z / 3500);
-    for (let k = 0; k < WAVES.length; k++) amps[k] = Math.exp(-z * WAVES[k].k * 0.008);
-    for (let px = 0; px < WATER_W; px++) {
-      const X = ((px + 0.5) * C.W / WATER_W - C.W / 2) * z / f + cam.x;
+  for (let py = 0; py < SH; py++) {
+    const dy = (C.horizonY - (py + 0.5) * C.H / SH) / f;
+    for (let px = 0; px < SW; px++) {
+      const dx = ((px + 0.5) * C.W / SW - C.W / 2) / f;
+      let wx = dx * CB.rx + dy * CB.ux + CB.fx, wy = dy * CB.uy + CB.fy, wz = dx * CB.rz + dy * CB.uz + CB.fz;
+      const il = 1 / Math.sqrt(wx * wx + wy * wy + wz * wz); wx *= il; wy *= il; wz *= il;
+
+      if (wy >= -0.0008) {                                   // ---- sky
+        skyColour(wx, Math.max(wy, 0), wz, 3);
+        data[i++] = SR; data[i++] = SG; data[i++] = SB; data[i++] = 255;
+        continue;
+      }
+      // ---- water: where does the ray hit the surface?
+      const tt0 = cam.h / -wy, X = cam.x + wx * tt0, Z = camZ + wz * tt0;
+      const z = tt0 * Math.sqrt(wx * wx + wz * wz);
       let gx = 0, gz = 0;
       for (let k = 0; k < WAVES.length; k++) {
-        const a = amps[k]; if (a < 0.02) continue;
-        const w = WAVES[k];
+        const w = WAVES[k], a = 1 - z * w.k * 0.006; if (a <= 0) continue;   // fade out small waves far away
         const c = Math.cos(w.k * (w.dir[0] * X + w.dir[1] * Z) - w.speed * t * 1.6) * w.amp * w.k * a;
         gx += c * w.dir[0]; gz += c * w.dir[1];
       }
       const nl = 1 / Math.sqrt(gx * gx + 1 + gz * gz);
       const nx = -gx * nl, ny = nl, nz = -gz * nl;
-      let vx = cam.x - X, vy = cam.h, vz = -z; const vl = 1 / Math.sqrt(vx * vx + vy * vy + vz * vz); vx *= vl; vy *= vl; vz *= vl;
+      const vx = -wx, vy = -wy, vz = -wz;
       const ndv = Math.max(0.0001, nx * vx + ny * vy + nz * vz);
-      // reflection
-      const rx = 2 * ndv * nx - vx, ry = 2 * ndv * ny - vy, rz = 2 * ndv * nz - vz;
-      const sk = Math.sqrt(Math.min(1, Math.max(0, ry) * 3));
-      const sr = 247 - 152 * sk, sg = 217 - 49 * sk, sb = 166 + 54 * sk;
-      const om = 1 - ndv, om2 = om * om;
-      const F = 0.02 + 0.98 * om2 * om2 * om;
+      const rx = 2 * ndv * nx - vx, rz = 2 * ndv * nz - vz;
+      let ry = 2 * ndv * ny - vy; if (ry < 0.001) ry = 0.001;
+
+      // reflection: mountains / hills / trees, otherwise the sky
+      let sr, sg, sb, ridge = -1;
+      if (ry < 0.11) { const az = Math.atan2(rx, rz); for (let L = 2; L >= 0; L--) if (ry < ridgeLookup(az, L)) { ridge = L; break; } }
+      skyColour(rx, ry, rz, ridge >= 0 ? 0 : 1);
+      if (ridge >= 0) {
+        const c = RIDGES[ridge].col, hz = RIDGES[ridge].haze * 0.7 + 0.15;
+        sr = c[0] * (1 - hz) + SR * hz; sg = c[1] * (1 - hz) + SG * hz; sb = c[2] * (1 - hz) + SB * hz;
+      } else { sr = SR; sg = SG; sb = SB; }
+      const om = 1 - ndv, om2 = om * om, F = 0.02 + 0.98 * om2 * om2 * om;
+
       // refraction → lake bed
-      let wr = 10, wg = 56, wb = 76;                       // deep-water scatter colour
-      const kk = 1 - ETA * ETA * (1 - ndv * ndv);
-      const tt = ETA * ndv - Math.sqrt(kk);
-      const tx = -ETA * vx + tt * nx, ty = -ETA * vy + tt * ny, tz = -ETA * vz + tt * nz;
+      let wr = 10, wg = 56, wb = 76;
+      const kk = 1 - ETA * ETA * (1 - ndv * ndv), tq = ETA * ndv - Math.sqrt(kk);
+      const tx = -ETA * vx + tq * nx, ty = -ETA * vy + tq * ny, tz = -ETA * vz + tq * nz;
       const D = bedDepth(X, Z), sLen = D / Math.max(0.05, -ty);
       if (sLen < 500) {
         const bx = X + tx * sLen, bz = Z + tz * sLen;
         const m = vnoise(bx * 0.025, bz * 0.025), grain = 0.85 + vnoise(bx * 0.15, bz * 0.15) * 0.3;
-        const weed = clamp((m - 0.58) * 8, 0, 1), rock = clamp((0.3 - m) * 10, 0, 1), sand = 1 - weed - rock;
+        const weed = clamp((m - 0.56) * 4, 0, 1), rock = clamp((0.32 - m) * 5, 0, 1), sand = 1 - weed - rock;
         let cr = (190 * sand + 58 * weed + 96 * rock) * grain;
         let cg = (172 * sand + 96 * weed + 94 * rock) * grain;
         let cb = (120 * sand + 44 * weed + 88 * rock) * grain;
         let cs = Math.sin(bx * 0.09 + t * 1.4) + Math.sin(bz * 0.11 - t * 1.1) + Math.sin((bx + bz) * 0.06 + t * 0.8);
-        cs = cs > 1 ? (cs - 1) * 0.6 * Math.exp(-D * 0.02) : 0;    // caustics
+        cs = cs > 1 ? (cs - 1) * 0.6 * Math.exp(-D * 0.02) : 0;
         cr *= 1 + cs; cg *= 1 + cs; cb *= 1 + cs;
-        const ar = Math.exp(-sLen * 0.03), ag = Math.exp(-sLen * 0.012), ab = Math.exp(-sLen * 0.009);
+        const ar = Math.exp(-sLen * 0.04), ag = Math.exp(-sLen * 0.016), ab = Math.exp(-sLen * 0.011);
         wr = cr * ar + wr * (1 - ar); wg = cg * ag + wg * (1 - ag); wb = cb * ab + wb * (1 - ab);
       }
       let r = wr + (sr - wr) * F, g = wg + (sg - wg) * F, b = wb + (sb - wb) * F;
-      const sd = rx * SUN[0] + ry * SUN[1] + rz * SUN[2];
-      if (sd > 0.95) { const s = Math.pow(sd, 260) * 3.5; r += 255 * s; g += 238 * s; b += 200 * s; }
-      r += (228 - r) * haze * 0.6; g += (212 - g) * haze * 0.6; b += (182 - b) * haze * 0.6;
+      if (ridge < 0) {                                      // sun glints
+        const sd = rx * SUN[0] + ry * SUN[1] + rz * SUN[2];
+        if (sd > 0.95) { const s = Math.pow(sd, 260) * 3.5; r += 255 * s; g += 236 * s; b += 196 * s; }
+      }
+      const haze = (1 - Math.exp(-z / 3200)) * 0.65;
+      r += (HORIZON_RGB[0] - r) * haze; g += (HORIZON_RGB[1] - g) * haze; b += (HORIZON_RGB[2] - b) * haze;
       data[i++] = r; data[i++] = g; data[i++] = b; data[i++] = 255;
     }
   }
-  wctx.putImageData(waterImg, 0, 0);
+  sctx.putImageData(sceneImg, 0, 0);
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(waterCanvas, 0, top, C.W, span);
+  ctx.drawImage(sceneCanvas, 0, 0, C.W, C.H);
+
+  const ms = performance.now() - t0;
+  qAvg = qAvg * 0.95 + ms * 0.05;
+  if (qAvg > 11 && qLevel < QUALITY.length - 1) { setQuality(qLevel + 1); qAvg = 7; }
+  else if (qAvg < 4 && qLevel > 0) { setQuality(qLevel - 1); qAvg = 7; }
+}
+
+function drawRidges() {
+  const C = CONFIG, f = C.camera.focal;
+  const tp = -CB.fy / CB.uy;                 // tan(pitch)
+  const hy = C.horizonY - tp * f;            // screen y of the horizon
+  if (hy < -20 || hy > C.H + 200) return;
+  for (let i = 0; i < RIDGES.length; i++) {
+    const R = RIDGES[i];
+    ctx.beginPath();
+    let minY = hy, first = true;
+    for (let sx = -20; sx <= C.W + 20; sx += R.step) {
+      const dx = (sx - C.W / 2) / f;
+      const hx = dx * CB.rx + tp * CB.ux + CB.fx, hz = dx * CB.rz + tp * CB.uz + CB.fz;
+      const a = Math.atan2(hx, hz), e = ridgeH(a, i);
+      const ce = Math.cos(e), Dx = Math.sin(a) * ce, Dy = Math.sin(e), Dz = Math.cos(a) * ce;
+      const yc = Dx * CB.ux + Dy * CB.uy + Dz * CB.uz, zc = Dx * CB.fx + Dy * CB.fy + Dz * CB.fz;
+      if (zc <= 0.01) continue;
+      const y = C.horizonY - yc / zc * f;
+      if (first) { ctx.moveTo(sx, y); first = false; } else ctx.lineTo(sx, y);
+      if (y < minY) minY = y;
+    }
+    ctx.lineTo(C.W + 20, hy + 1.5); ctx.lineTo(-20, hy + 1.5); ctx.closePath();
+    const g = ctx.createLinearGradient(0, minY, 0, hy);
+    const c = R.col, low = c.map((v, k) => Math.round(lerp(v, HORIZON_RGB[k], R.haze)));
+    const top = c.map((v, k) => Math.round(lerp(v, HORIZON_RGB[k], R.haze * 0.35)));
+    g.addColorStop(0, `rgb(${top})`); g.addColorStop(1, `rgb(${low})`);
+    ctx.fillStyle = g; ctx.fill();
+  }
+}
+
+const BIRDS = Array.from({ length: 5 }, (_, i) => ({ a: -0.6 + i * 0.22 + Math.random() * 0.1, e: 0.12 + Math.random() * 0.1, sp: 0.012 + Math.random() * 0.01, ph: Math.random() * 6, flap: 7 + Math.random() * 3 }));
+function projectDir(x, y, z) {
+  const zc = x * CB.fx + y * CB.fy + z * CB.fz;
+  if (zc <= 0.02) return null;
+  const f = CONFIG.camera.focal;
+  return { x: CONFIG.W / 2 + (x * CB.rx + z * CB.rz) / zc * f, y: CONFIG.horizonY - (x * CB.ux + y * CB.uy + z * CB.uz) / zc * f };
+}
+function drawBirds() {
+  ctx.strokeStyle = 'rgba(40,40,55,0.75)'; ctx.lineWidth = 1.3; ctx.lineCap = 'round';
+  for (const b of BIRDS) {
+    const ce = Math.cos(b.e), p = projectDir(Math.sin(b.a) * ce, Math.sin(b.e) + Math.sin(b.ph * 0.13) * 0.004, Math.cos(b.a) * ce);
+    if (!p) continue;
+    const w = Math.sin(b.ph) * 3;
+    ctx.beginPath(); ctx.moveTo(p.x - 6, p.y - w); ctx.quadraticCurveTo(p.x - 3, p.y - 2 - w * 0.3, p.x, p.y);
+    ctx.quadraticCurveTo(p.x + 3, p.y - 2 - w * 0.3, p.x + 6, p.y - w); ctx.stroke();
+  }
+}
+
+function drawSunBloom() {
+  const p = projectDir(SUN[0], SUN[1], SUN[2]);
+  if (!p) return;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 260);
+  g.addColorStop(0, 'rgba(255,236,190,0.35)'); g.addColorStop(0.25, 'rgba(255,210,150,0.12)'); g.addColorStop(1, 'rgba(255,200,140,0)');
+  ctx.fillStyle = g; ctx.fillRect(p.x - 260, p.y - 260, 520, 520);
+  ctx.restore();
+}
+
+function drawVignette() {
+  const C = CONFIG;
+  const vg = ctx.createRadialGradient(C.W / 2, C.H / 2, C.H * 0.45, C.W / 2, C.H / 2, C.W * 0.72);
+  vg.addColorStop(0, 'rgba(20,10,0,0)'); vg.addColorStop(1, 'rgba(20,10,0,0.28)');
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, C.W, C.H);
 }
 
 // Fish seen from above, through the water: faded by Fresnel + depth, tinted toward water colour.
@@ -865,6 +1065,7 @@ function drawFishTop(f) {
   const H = project(f.X + c * L * 0.5, f.Z + s * L * 0.5, Y);
   const T = project(f.X - c * L * 0.4, f.Z - s * L * 0.4, Y);
   const M = project(f.X + c * L * 0.08, f.Z + s * L * 0.08, Y);
+  if (H.behind || T.behind || M.behind) return;
   let ax = H.x - T.x, ay = H.y - T.y; const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
   const px = -ay, py = ax, ppu = M.s * C.camera.focal / 300;
   const w = Math.max(0.8, L * 0.13 * ppu), wag = Math.sin(f.phase) * w * 0.9, tl = L * 0.22 * ppu;
@@ -955,11 +1156,12 @@ function drawSplash() {
 function drawAimGuide() {
   ctx.fillStyle = 'rgba(255,255,255,0.3)';
   for (let d = 0; d <= CONFIG.cast.maxDist; d += 40) {
-    const p = project(aimToX(game.aim, d), d);
+    const p = project(aimToX(curAim(), d), d);
+    if (p.behind) continue;
     ctx.beginPath(); ctx.ellipse(p.x, p.y, 3 * p.s, p.s, 0, 0, Math.PI * 2); ctx.fill();
   }
   if (game.state === 'CHARGING') {
-    const d = lerp(CONFIG.cast.minDist, CONFIG.cast.maxDist, game.power), p = project(aimToX(game.aim, d), d);
+    const d = lerp(CONFIG.cast.minDist, CONFIG.cast.maxDist, game.power), p = project(aimToX(curAim(), d), d);
     ctx.strokeStyle = 'rgba(255,235,59,0.85)'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.ellipse(p.x, p.y, 16 * p.s, 5 * p.s, 0, 0, Math.PI * 2); ctx.stroke();
   }
@@ -1096,8 +1298,10 @@ function drawHUDInner() {
   };
   const hint = hints[game.state] || '';
   ctx.textAlign = 'center'; ctx.font = 'bold 18px system-ui';
-  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillText(hint, C.W / 2 + 1, C.horizonY - 39);
-  ctx.fillStyle = '#fff'; ctx.fillText(hint, C.W / 2, C.horizonY - 40);
+  ctx.fillStyle = '#fff'; ctx.fillText(hint, C.W / 2, 150);
+  ctx.font = '13px system-ui'; ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(game.look.locked ? 'Free-look on · F to release the mouse · C to recenter'
+                                : 'Look around: right-drag or WASD · F: lock mouse · C: recenter', C.W / 2, 172);
 
   if (game.state === 'CHARGING') {
     const hue = lerp(120, 0, game.power);
